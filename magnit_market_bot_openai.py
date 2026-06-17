@@ -388,6 +388,27 @@ async def handle_feedback_button(update: Update, context: ContextTypes.DEFAULT_T
 
 class PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == "/feedback":
+            # Отдаём CSV-файл с обратной связью для скачивания
+            if os.path.exists(FEEDBACK_FILE):
+                with open(FEEDBACK_FILE, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-type", "text/csv; charset=utf-8")
+                self.send_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{FEEDBACK_FILE}"'
+                )
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self.send_response(404)
+                self.send_header("Content-type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"feedback_log.csv not found yet")
+            return
+
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
