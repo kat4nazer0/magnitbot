@@ -2,15 +2,30 @@
 Telegram-бот для продавцов Магнит Маркет 3P — OpenAI GPT
 Установка: pip3 install openai python-telegram-bot
 Рядом со скриптом должен лежать файл faq.txt (база знаний)
+
+Фича обратной связи:
+- под каждым ответом бота появляются кнопки "✅ Правда" / "❌ Ложь"
+- "Правда" — бот благодарит
+- "Ложь" — бот просит написать правильный ответ, и сохраняет
+  пару (вопрос, неверный ответ бота, правильный ответ менеджера,
+  кто оценил) в файл feedback_log.csv рядом со скриптом
 """
 
 import os
+import csv
 import logging
+import threading
+from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 from openai import OpenAI
-from telegram import Update, BotCommand
+from telegram import (
+    Update, BotCommand,
+    InlineKeyboardButton, InlineKeyboardMarkup
+)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    filters, ContextTypes
+    CallbackQueryHandler, filters, ContextTypes
 )
 
 # ─────────────────────────────────────────────────────────
@@ -20,18 +35,18 @@ from telegram.ext import (
 # На Railway: оставьте кавычки пустыми — токены подставятся
 # автоматически из переменных окружения (Variables).
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") or "ВАШ_ТОКЕН"
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or "ВАШ_ТОКЕН"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") or "ВАШ_ТОКЕН_ОТ_BOTFATHER"
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or "ВАШ_КЛЮЧ_ОТ_OPENAI"
 
-GPT_MODEL   = "gpt-4o-mini"   # хорошее качество, низкая цена
-MAX_HISTORY = 10              # сколько сообщений помнит бот в сессии
-CHUNK_SIZE  = 9000             # размер одного блока базы знаний в символах
+GPT_MODEL       = "gpt-4o-mini"
+MAX_HISTORY     = 10
+FEEDBACK_FILE   = "feedback_log.csv"
 
 # ─────────────────────────────────────────────────────────
-# БАЗОВЫЙ СИСТЕМНЫЙ ПРОМПТ (роль, поведение, формат, эскалация)
+# СИСТЕМНЫЙ ПРОМПТ
 # ─────────────────────────────────────────────────────────
 
-BASE_SYSTEM_PROMPT = """СИСТЕМНЫЙ ПРОМПТ — AI-АССИСТЕНТ МАГНИТ МАРКЕТ 3P
+SYSTEM_PROMPT_BASE = """СИСТЕМНЫЙ ПРОМПТ — AI-АССИСТЕНТ МАГНИТ МАРКЕТ 3P
 
 Ты — AI-помощник команды массового привлечения маркетплейса Магнит Маркет.
 Твоя задача — помогать продавцам (селлерам) работать с платформой: отвечать
@@ -67,34 +82,36 @@ BASE_SYSTEM_PROMPT = """СИСТЕМНЫЙ ПРОМПТ — AI-АССИСТЕН�
 ────────────────────────────────────────────────────────
 Отвечай ТОЛЬКО на вопросы, связанные с:
 • Регистрацией и верификацией продавца
-• Загрузкой и управлением документами (сертификаты, декларации и т.д.)
+• Загрузкой и управлением документами
 • Созданием магазина и карточек товаров
 • Массовой загрузкой товаров через Excel
 • Финансами: выплаты, комиссии, акты
 • Логистикой: FBS, FBO, упаковка, возвраты
 • Рекламой и продвижением товаров на площадке
 • Техническими вопросами по личному кабинету
+
 Если вопрос не связан с работой на Магнит Маркет — вежливо сообщи,
 что ты специализируешься только на вопросах платформы.
 
 ────────────────────────────────────────────────────────
 КОМИССИИ
 ────────────────────────────────────────────────────────
-Если у тебя спрашивают размер комиссии — посмотри максимально релевантную
-ставку в базе знаний и укажи её отдельно для FBO и для FBS. А также
-предложи скачать и посмотреть файл целиком по ссылке, если она есть в базе.
+Если у тебя спрашивают размер комиссии, посмотри максимально релевантную
+запись в базе знаний и укажи комиссию отдельно для FBO и FBS. Дополнительно
+предложи скачать и посмотреть файл целиком с полной таблицей по всем
+подкатегориям.
 
 ────────────────────────────────────────────────────────
-ИНСТРУКЦИЯ ПРОДАВЦА (доп. источник)
+ИНСТРУКЦИЯ ПРОДАВЦА
 ────────────────────────────────────────────────────────
-Как источник можно также использовать Инструкцию продавца по ссылке:
+Как дополнительный источник можешь использовать Инструкцию продавца:
 https://seller-manual.mm.ru/
-Если используешь ответ оттуда как источник — указывай, какой пункт инструкции.
+Если берёшь ответ оттуда — указывай, какой раздел/пункт инструкции.
 
 ────────────────────────────────────────────────────────
 ПОДДЕРЖКА
 ────────────────────────────────────────────────────────
-Если не знаешь как ответить, можно предложить обратиться в поддержку
+Если не знаешь точного ответа, предложи обратиться в поддержку
 в Личном кабинете продавца или в Telegram-бот:
 https://t.me/MagnitMarketBusiness_Bot
 
@@ -104,29 +121,15 @@ https://t.me/MagnitMarketBusiness_Bot
 Если ответа нет в базе знаний или ситуация нестандартная, отвечай так:
 «К сожалению, у меня нет точного ответа на этот вопрос.
 Рекомендую обратиться напрямую в поддержку Магнит Маркет:
-🔗 seller.magnit.ru/support
+🔗 https://t.me/MagnitMarketBusiness_Bot
 или написать вашему менеджеру по работе с продавцами.»
-
-────────────────────────────────────────────────────────
-ПРИМЕР ХОРОШЕГО ОТВЕТА
-────────────────────────────────────────────────────────
-Вопрос продавца: «Как мне зарегистрироваться?»
-Хороший ответ:
-«Для регистрации на Магнит Маркет выполните следующие шаги:
-1. Перейдите на seller.magnit.ru
-2. Нажмите кнопку «Стать продавцом»
-3. Заполните форму: укажите ИНН, email и номер телефона
-4. Подтвердите email по ссылке из письма
-5. Дождитесь проверки аккаунта — обычно это занимает 1–2 рабочих дня
-🔗 Подробнее: Регистрация продавца — seller.magnit.ru/register
-Если остались вопросы — смело спрашивайте!»
 """
 
 # ─────────────────────────────────────────────────────────
-# ЗАГРУЗКА БАЗЫ ЗНАНИЙ (faq.txt) И РАЗБИВКА НА ЧАНКИ
+# ЗАГРУЗКА FAQ
 # ─────────────────────────────────────────────────────────
 
-def load_faq(path="faq.txt", chunk_size=CHUNK_SIZE):
+def load_faq(path="faq.txt", chunk_size=8000):
     try:
         text = open(path, encoding="utf-8").read()
         blocks = text.split("---")
@@ -150,23 +153,43 @@ FAQ_CHUNKS = load_faq()
 
 
 def find_relevant_chunks(question: str, top_n: int = 2) -> str:
-    """Находит top_n наиболее релевантных блока FAQ по словам из вопроса."""
     question_lower = question.lower()
     words = [w for w in question_lower.split() if len(w) > 3]
-
     scored = []
     for chunk in FAQ_CHUNKS:
         chunk_lower = chunk.lower()
         score = sum(1 for w in words if w in chunk_lower)
         scored.append((score, chunk))
-
     scored.sort(key=lambda x: x[0], reverse=True)
     top_chunks = [c for s, c in scored[:top_n] if s > 0]
-
     if not top_chunks:
-        top_chunks = [FAQ_CHUNKS[0]]
-
+        top_chunks = [scored[0][1]]
     return "\n\n".join(top_chunks)
+
+
+# ─────────────────────────────────────────────────────────
+# ФАЙЛ ОБРАТНОЙ СВЯЗИ
+# ─────────────────────────────────────────────────────────
+
+def init_feedback_file():
+    if not os.path.exists(FEEDBACK_FILE):
+        # encoding="utf-8-sig" добавляет BOM-маркер в начало файла —
+        # благодаря этому Excel (включая Mac) сам определяет UTF-8
+        # и открывает кириллицу без иероглифов при обычном открытии файла
+        with open(FEEDBACK_FILE, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "дата_время", "пользователь_id", "имя_пользователя",
+                "вопрос", "ответ_бота", "оценка", "правильный_ответ"
+            ])
+
+def save_feedback(user_id, username, question, bot_answer, verdict, correction=""):
+    with open(FEEDBACK_FILE, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            user_id, username, question, bot_answer, verdict, correction
+        ])
 
 
 # ─────────────────────────────────────────────────────────
@@ -181,16 +204,22 @@ logger = logging.getLogger(__name__)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# История диалогов: {user_id: [{"role": ..., "content": ...}, ...]}
 histories: dict[int, list] = {}
+
+# Временное хранилище последнего вопроса/ответа для каждого сообщения бота
+# {message_id: {"user_id":, "username":, "question":, "answer":}}
+pending_feedback: dict[int, dict] = {}
+
+# Кто сейчас в режиме "пишет правильный ответ": {user_id: message_id}
+awaiting_correction: dict[int, int] = {}
 
 
 def get_response(user_id: int, user_message: str) -> str:
     if user_id not in histories:
         histories[user_id] = []
 
-    relevant_faq = find_relevant_chunks(user_message, top_n=2)
-    system_prompt = f"{BASE_SYSTEM_PROMPT}\n\nБАЗА ЗНАНИЙ (релевантные разделы):\n{relevant_faq}"
+    relevant_faq = find_relevant_chunks(user_message)
+    system_prompt = f"{SYSTEM_PROMPT_BASE}\n\n────────────────────────────────────────────────────────\nБАЗА ЗНАНИЙ (релевантные разделы)\n────────────────────────────────────────────────────────\n{relevant_faq}"
 
     histories[user_id].append({"role": "user", "content": user_message})
     history = histories[user_id][-MAX_HISTORY:]
@@ -212,10 +241,14 @@ def get_response(user_id: int, user_message: str) -> str:
 
     except Exception as e:
         logger.error(f"Ошибка OpenAI для user {user_id}: {e}")
-        return (
-            f"Произошла техническая ошибка: {str(e)}\n\n"
-            "Обратитесь в поддержку: @MagnitMarketBusiness_Bot"
-        )
+        return f"Техническая ошибка: {str(e)}\n\nОбратитесь в поддержку: @MagnitMarketBusiness_Bot"
+
+
+def feedback_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Правда", callback_data="fb_true"),
+        InlineKeyboardButton("❌ Ложь", callback_data="fb_false"),
+    ]])
 
 
 # ─────────────────────────────────────────────────────────
@@ -229,8 +262,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Привет, {user.first_name}! 👋\n\n"
         "Я — AI-помощник Магнит Маркет для продавцов.\n"
         "Помогу с регистрацией, документами, карточками товаров, "
-        "комиссиями, накладными и логистикой.\n\n"
-        "Задайте любой вопрос! 🛍️\n\n"
+        "накладными, складами и комиссиями.\n\n"
+        "Под каждым моим ответом есть кнопки ✅/❌ — оцените, "
+        "пожалуйста, насколько ответ был верным, это помогает "
+        "сделать бота лучше!\n\n"
         "/help — список тем\n"
         "/reset — очистить историю"
     )
@@ -244,8 +279,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🗂 Создание карточки товара — поля, фото, шаблон Excel\n"
         "📦 Накладные FBO — создание, правила, упаковка, УПД\n"
         "🏭 Склад FBS — создание, остатки, заборная логистика\n"
-        "💰 Комиссии и финансы — выплаты, ставки, документы\n"
-        "🚚 Отправка и возврат товара со склада\n\n"
+        "💰 Финансы и комиссии — выплаты, ставки по категориям\n"
+        "📢 Условия работы — договор, ограничения, тарифы\n\n"
         "Напишите вопрос обычным текстом!"
     )
 
@@ -255,17 +290,118 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("История очищена. Начните с нового вопроса! ✅")
 
 
+# ─────────────────────────────────────────────────────────
+# ОБРАБОТКА ОБЫЧНЫХ СООБЩЕНИЙ
+# ─────────────────────────────────────────────────────────
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     user_message = update.message.text
+
+    # Если пользователь сейчас должен написать правильный ответ —
+    # это сообщение не вопрос боту, а коррекция предыдущего ответа
+    if user.id in awaiting_correction:
+        msg_id = awaiting_correction.pop(user.id)
+        record = pending_feedback.get(msg_id)
+        if record:
+            save_feedback(
+                user_id=user.id,
+                username=user.username or user.first_name,
+                question=record["question"],
+                bot_answer=record["answer"],
+                verdict="Ложь",
+                correction=user_message
+            )
+            logger.info(f"Получена коррекция от {user.id}: {user_message[:80]}")
+        await update.message.reply_text(
+            "Спасибо, записал правильный вариант! Передам команде "
+            "для обновления базы знаний. 🙏"
+        )
+        return
+
     logger.info(f"[{user.id}] {user.first_name}: {user_message[:80]}")
 
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action="typing"
     )
 
-    response = get_response(user.id, user_message)
-    await update.message.reply_text(response)
+    answer = get_response(user.id, user_message)
+    sent_message = await update.message.reply_text(
+        answer, reply_markup=feedback_keyboard()
+    )
+
+    # Запоминаем вопрос/ответ, привязанные к id отправленного сообщения
+    pending_feedback[sent_message.message_id] = {
+        "user_id": user.id,
+        "username": user.username or user.first_name,
+        "question": user_message,
+        "answer": answer,
+    }
+
+
+# ─────────────────────────────────────────────────────────
+# ОБРАБОТКА НАЖАТИЙ НА КНОПКИ
+# ─────────────────────────────────────────────────────────
+
+async def handle_feedback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()  # убирает "часики" на кнопке
+
+    msg_id = query.message.message_id
+    record = pending_feedback.get(msg_id)
+
+    if not record:
+        # Сообщение слишком старое или бот перезапускался
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
+
+    if query.data == "fb_true":
+        save_feedback(
+            user_id=record["user_id"],
+            username=record["username"],
+            question=record["question"],
+            bot_answer=record["answer"],
+            verdict="Правда"
+        )
+        # Убираем кнопки, показываем благодарность
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Спасибо за оценку! 🙌")
+        pending_feedback.pop(msg_id, None)
+
+    elif query.data == "fb_false":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            "Спасибо, что заметили! Напишите, пожалуйста, как должен "
+            "звучать правильный ответ на этот вопрос — я передам его "
+            "команде для обновления базы знаний."
+        )
+        # Переводим пользователя в режим ожидания коррекции
+        awaiting_correction[query.from_user.id] = msg_id
+
+
+# ─────────────────────────────────────────────────────────
+# КРОШЕЧНЫЙ ВЕБ-СЕРВЕР — нужен только для Render.com
+# Render требует, чтобы Web Service слушал какой-то порт.
+# Сам сервер ничего не делает, кроме ответа "ok" на пинг.
+# На Railway/локально он не мешает — просто не используется Render'ом.
+# ─────────────────────────────────────────────────────────
+
+class PingHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Magnit Market bot is running")
+
+    def log_message(self, format, *args):
+        pass  # отключаем лишние логи от веб-сервера
+
+
+def start_ping_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), PingHandler)
+    logger.info(f"🌐 Ping-сервер запущен на порту {port}")
+    server.serve_forever()
 
 
 # ─────────────────────────────────────────────────────────
@@ -273,10 +409,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ─────────────────────────────────────────────────────────
 
 def main() -> None:
+    init_feedback_file()
+
+    # Запускаем веб-сервер в отдельном потоке, чтобы Render видел
+    # открытый порт и не считал сервис мёртвым
+    threading.Thread(target=start_ping_server, daemon=True).start()
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",  start))
     app.add_handler(CommandHandler("help",   help_command))
     app.add_handler(CommandHandler("reset",  reset_command))
+    app.add_handler(CallbackQueryHandler(handle_feedback_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     async def set_commands(app):
