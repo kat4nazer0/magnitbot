@@ -12,12 +12,14 @@ Telegram-бот для продавцов Магнит Маркет 3P — OpenA
 """
 
 import os
-import csv
+import json
 import logging
 import threading
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+import gspread
+from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from telegram import (
     Update, BotCommand,
@@ -40,7 +42,13 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or "ВАШ_КЛЮЧ_ОТ_OPENA
 
 GPT_MODEL       = "gpt-4o-mini"
 MAX_HISTORY     = 10
-FEEDBACK_FILE   = "feedback_log.csv"
+
+# ID вашей Google таблицы (из ссылки)
+SPREADSHEET_ID  = "12t38O0ul0hWgg2p1XJzsgMatj5oP6kVQyWm5sIw2htU"
+
+# Ключ сервисного аккаунта — читается из переменной окружения на Render
+# или из файла локально
+GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON")
 
 # ─────────────────────────────────────────────────────────
 # СИСТЕМНЫЙ ПРОМПТ
@@ -171,25 +179,56 @@ def find_relevant_chunks(question: str, top_n: int = 2) -> str:
 # ФАЙЛ ОБРАТНОЙ СВЯЗИ
 # ─────────────────────────────────────────────────────────
 
-def init_feedback_file():
-    if not os.path.exists(FEEDBACK_FILE):
-        # encoding="utf-8-sig" добавляет BOM-маркер в начало файла —
-        # благодаря этому Excel (включая Mac) сам определяет UTF-8
-        # и открывает кириллицу без иероглифов при обычном открытии файла
-        with open(FEEDBACK_FILE, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow([
+# ─────────────────────────────────────────────────────────
+# GOOGLE SHEETS — инициализация и запись фидбэка
+# ─────────────────────────────────────────────────────────
+
+def get_sheet():
+    """Подключается к Google Sheets и возвращает первый лист."""
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    if GOOGLE_CREDS_JSON:
+        # На Render: читаем из переменной окружения
+        creds_dict = json.loads(GOOGLE_CREDS_JSON)
+    else:
+        # Локально: читаем из файла рядом со скриптом
+        with open("google_creds.json", encoding="utf-8") as f:
+            creds_dict = json.load(f)
+
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    client = gspread.authorize(creds)
+    return client.open_by_key(SPREADSHEET_ID).sheet1
+
+
+def init_sheet():
+    """Добавляет шапку таблицы если она ещё пустая."""
+    try:
+        sheet = get_sheet()
+        if not sheet.row_values(1):
+            sheet.append_row([
                 "дата_время", "пользователь_id", "имя_пользователя",
                 "вопрос", "ответ_бота", "оценка", "правильный_ответ"
             ])
+            logger.info("✅ Google Sheets: шапка добавлена")
+        else:
+            logger.info("✅ Google Sheets: подключение успешно")
+    except Exception as e:
+        logger.error(f"Ошибка подключения к Google Sheets: {e}")
+
 
 def save_feedback(user_id, username, question, bot_answer, verdict, correction=""):
-    with open(FEEDBACK_FILE, "a", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow([
+    """Записывает строку фидбэка в Google Sheets."""
+    try:
+        sheet = get_sheet()
+        sheet.append_row([
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            user_id, username, question, bot_answer, verdict, correction
+            str(user_id), username, question, bot_answer, verdict, correction
         ])
+        logger.info(f"✅ Фидбэк записан в таблицу: {verdict}")
+    except Exception as e:
+        logger.error(f"Ошибка записи в Google Sheets: {e}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -389,24 +428,11 @@ async def handle_feedback_button(update: Update, context: ContextTypes.DEFAULT_T
 class PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/feedback":
-            # Отдаём CSV-файл с обратной связью для скачивания
-            if os.path.exists(FEEDBACK_FILE):
-                with open(FEEDBACK_FILE, "rb") as f:
-                    data = f.read()
-                self.send_response(200)
-                self.send_header("Content-type", "text/csv; charset=utf-8")
-                self.send_header(
-                    "Content-Disposition",
-                    f'attachment; filename="{FEEDBACK_FILE}"'
-                )
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-            else:
-                self.send_response(404)
-                self.send_header("Content-type", "text/plain")
-                self.end_headers()
-                self.wfile.write(b"feedback_log.csv not found yet")
+            # Перенаправляем на Google таблицу с фидбэком
+            url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
+            self.send_response(302)
+            self.send_header("Location", url)
+            self.end_headers()
             return
 
         self.send_response(200)
@@ -430,7 +456,7 @@ def start_ping_server():
 # ─────────────────────────────────────────────────────────
 
 def main() -> None:
-    init_feedback_file()
+    init_sheet()
 
     # Запускаем веб-сервер в отдельном потоке, чтобы Render видел
     # открытый порт и не считал сервис мёртвым
