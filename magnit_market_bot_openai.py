@@ -12,6 +12,7 @@ Telegram-бот для продавцов Магнит Маркет 3P — OpenA
 """
 
 import os
+import re
 import json
 import logging
 import threading
@@ -221,16 +222,19 @@ def init_sheet():
 
 
 def save_feedback(user_id, username, question, bot_answer, verdict, correction=""):
-    """Записывает строку фидбэка в Google Sheets."""
-    try:
-        sheet = get_sheet()
-        sheet.append_row([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            str(user_id), username, question, bot_answer, verdict, correction
-        ])
-        logger.info(f"✅ Фидбэк записан в таблицу: {verdict}")
-    except Exception as e:
-        logger.error(f"Ошибка записи в Google Sheets: {e}")
+    """Записывает строку фидбэка в Google Sheets в отдельном потоке
+    чтобы не блокировать основной async-поток бота."""
+    def _write():
+        try:
+            sheet = get_sheet()
+            sheet.append_row([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                str(user_id), username, question, bot_answer, verdict, correction
+            ])
+            logger.info(f"✅ Фидбэк записан в таблицу: {verdict}")
+        except Exception as e:
+            logger.error(f"Ошибка записи в Google Sheets: {e}")
+    threading.Thread(target=_write, daemon=True).start()
 
 
 # ─────────────────────────────────────────────────────────
@@ -277,9 +281,8 @@ def get_response(user_id: int, user_message: str) -> str:
         )
         answer = response.choices[0].message.content
 
-        # Разворачиваем markdown-ссылки вида [текст](url) → url
-        # Telegram их не рендерит, показывает как есть — некрасиво
-        import re
+        # Разворачиваем markdown-ссылки [текст](url) → url
+        # Telegram их не рендерит — показывает сырой текст
         answer = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\2', answer)
 
         histories[user_id].append({"role": "assistant", "content": answer})
