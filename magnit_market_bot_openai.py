@@ -450,6 +450,13 @@ class PingHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Magnit Market bot is running")
 
+    def do_HEAD(self):
+        # UptimeRobot иногда шлёт HEAD вместо GET из европейских узлов —
+        # без этого метода сервер возвращает 501 Not Implemented
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+
     def log_message(self, format, *args):
         pass  # отключаем лишние логи от веб-сервера
 
