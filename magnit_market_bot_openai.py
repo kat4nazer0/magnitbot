@@ -3,12 +3,11 @@ Telegram-бот для продавцов Магнит Маркет 3P — OpenA
 Установка: pip3 install openai python-telegram-bot
 Рядом со скриптом должен лежать файл faq.txt (база знаний)
 
-Фича обратной связи:
-- под каждым ответом бота появляются кнопки "✅ Правда" / "❌ Ложь"
-- "Правда" — бот благодарит
-- "Ложь" — бот просит написать правильный ответ, и сохраняет
-  пару (вопрос, неверный ответ бота, правильный ответ менеджера,
-  кто оценил) в файл feedback_log.csv рядом со скриптом
+Система обратной связи:
+- под каждым ответом бота появляются кнопки оценки от 1 до 5 звёзд
+- оценки 4-5: бот благодарит, записывает оценку в таблицу
+- оценки 1-2-3: бот предлагает написать комментарий что не так,
+  комментарий и оценка записываются в Google Sheets
 """
 
 import os
@@ -298,9 +297,13 @@ def get_response(user_id: int, user_message: str) -> str:
 
 
 def feedback_keyboard() -> InlineKeyboardMarkup:
+    # Кнопки оценки от 1 до 5 — понятны любому пользователю
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Правда", callback_data="fb_true"),
-        InlineKeyboardButton("❌ Ложь", callback_data="fb_false"),
+        InlineKeyboardButton("1", callback_data="fb_1"),
+        InlineKeyboardButton("2", callback_data="fb_2"),
+        InlineKeyboardButton("3", callback_data="fb_3"),
+        InlineKeyboardButton("4", callback_data="fb_4"),
+        InlineKeyboardButton("5", callback_data="fb_5"),
     ]])
 
 
@@ -316,9 +319,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Я — AI-помощник Магнит Маркет для продавцов.\n"
         "Помогу с регистрацией, документами, карточками товаров, "
         "накладными, складами и комиссиями.\n\n"
-        "Под каждым моим ответом есть кнопки ✅/❌ — оцените, "
-        "пожалуйста, насколько ответ был верным, это помогает "
-        "сделать бота лучше!\n\n"
+        "Задайте любой вопрос! После ответа вы сможете оценить "
+        "его по шкале от 1 до 5 — это помогает делать бота лучше.\n\n"
         "/help — список тем\n"
         "/reset — очистить историю"
     )
@@ -351,8 +353,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user = update.effective_user
     user_message = update.message.text
 
-    # Если пользователь сейчас должен написать правильный ответ —
-    # это сообщение не вопрос боту, а коррекция предыдущего ответа
+    # Если пользователь в режиме ввода комментария к низкой оценке
     if user.id in awaiting_correction:
         msg_id = awaiting_correction.pop(user.id)
         record = pending_feedback.get(msg_id)
@@ -362,13 +363,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 username=user.username or user.first_name,
                 question=record["question"],
                 bot_answer=record["answer"],
-                verdict="Ложь",
+                verdict=record["rating"],
                 correction=user_message
             )
-            logger.info(f"Получена коррекция от {user.id}: {user_message[:80]}")
+            logger.info(f"Получен комментарий от {user.id}: {user_message[:80]}")
         await update.message.reply_text(
-            "Спасибо, записал правильный вариант! Передам команде "
-            "для обновления базы знаний. 🙏"
+            "Спасибо за обратную связь! Передам команде для улучшения бота. 🙏"
         )
         return
 
@@ -380,55 +380,60 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     answer = get_response(user.id, user_message)
     sent_message = await update.message.reply_text(
-        answer, reply_markup=feedback_keyboard()
+        answer + "\n\n_Оцените ответ от 1 до 5:_",
+        reply_markup=feedback_keyboard()
     )
 
-    # Запоминаем вопрос/ответ, привязанные к id отправленного сообщения
     pending_feedback[sent_message.message_id] = {
         "user_id": user.id,
         "username": user.username or user.first_name,
         "question": user_message,
         "answer": answer,
+        "rating": None,
     }
 
 
 # ─────────────────────────────────────────────────────────
-# ОБРАБОТКА НАЖАТИЙ НА КНОПКИ
+# ОБРАБОТКА НАЖАТИЙ НА КНОПКИ ОЦЕНКИ
 # ─────────────────────────────────────────────────────────
 
 async def handle_feedback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()  # убирает "часики" на кнопке
+    await query.answer()
 
     msg_id = query.message.message_id
     record = pending_feedback.get(msg_id)
 
     if not record:
-        # Сообщение слишком старое или бот перезапускался
         await query.edit_message_reply_markup(reply_markup=None)
         return
 
-    if query.data == "fb_true":
+    # Определяем оценку из callback_data (fb_1 … fb_5)
+    rating = int(query.data.split("_")[1])
+    record["rating"] = str(rating)
+
+    await query.edit_message_reply_markup(reply_markup=None)
+
+    if rating >= 4:
+        # Высокая оценка — сразу благодарим и сохраняем
         save_feedback(
             user_id=record["user_id"],
             username=record["username"],
             question=record["question"],
             bot_answer=record["answer"],
-            verdict="Правда"
+            verdict=str(rating),
+            correction=""
         )
-        # Убираем кнопки, показываем благодарность
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text("Спасибо за оценку! 🙌")
+        await query.message.reply_text(f"Спасибо за оценку {rating}/5! 🙌")
         pending_feedback.pop(msg_id, None)
 
-    elif query.data == "fb_false":
-        await query.edit_message_reply_markup(reply_markup=None)
+    else:
+        # Низкая оценка (1-3) — просим комментарий
         await query.message.reply_text(
-            "Спасибо, что заметили! Напишите, пожалуйста, как должен "
-            "звучать правильный ответ на этот вопрос — я передам его "
-            "команде для обновления базы знаний."
+            f"Вы поставили {rating}/5. Что можно улучшить в ответе? "
+            f"Напишите пожалуйста — это поможет сделать бота точнее."
         )
-        # Переводим пользователя в режим ожидания коррекции
+        # Переводим пользователя в режим ввода комментария
         awaiting_correction[query.from_user.id] = msg_id
 
 
