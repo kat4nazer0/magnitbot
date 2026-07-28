@@ -297,13 +297,10 @@ def get_response(user_id: int, user_message: str) -> str:
 
 
 def feedback_keyboard() -> InlineKeyboardMarkup:
-    # Кнопки оценки от 1 до 5 — понятны любому пользователю
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("1", callback_data="fb_1"),
-        InlineKeyboardButton("2", callback_data="fb_2"),
-        InlineKeyboardButton("3", callback_data="fb_3"),
-        InlineKeyboardButton("4", callback_data="fb_4"),
-        InlineKeyboardButton("5", callback_data="fb_5"),
+        InlineKeyboardButton("👍 Помогло", callback_data="fb_5"),
+        InlineKeyboardButton("😐 Частично", callback_data="fb_3"),
+        InlineKeyboardButton("👎 Не помогло", callback_data="fb_1"),
     ]])
 
 
@@ -380,7 +377,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     answer = get_response(user.id, user_message)
     sent_message = await update.message.reply_text(
-        answer + "\n\n_Оцените ответ от 1 до 5:_",
+        answer + "\n\nОцените ответ:",
         reply_markup=feedback_keyboard()
     )
 
@@ -408,32 +405,35 @@ async def handle_feedback_button(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_reply_markup(reply_markup=None)
         return
 
-    # Определяем оценку из callback_data (fb_1 … fb_5)
+    # Определяем оценку из callback_data (fb_1, fb_3, fb_5)
     rating = int(query.data.split("_")[1])
-    record["rating"] = str(rating)
+
+    # Метка для записи в таблицу
+    rating_label = {5: "👍 Помогло", 3: "😐 Частично", 1: "👎 Не помогло"}.get(rating, str(rating))
+    record["rating"] = rating_label
 
     await query.edit_message_reply_markup(reply_markup=None)
 
-    if rating >= 4:
-        # Высокая оценка — сразу благодарим и сохраняем
+    if rating == 5:
+        # Помогло — сразу благодарим и сохраняем
         save_feedback(
             user_id=record["user_id"],
             username=record["username"],
             question=record["question"],
             bot_answer=record["answer"],
-            verdict=str(rating),
+            verdict=rating_label,
             correction=""
         )
-        await query.message.reply_text(f"Спасибо за оценку {rating}/5! 🙌")
+        await query.message.reply_text("Рад помочь! 👍")
         pending_feedback.pop(msg_id, None)
 
     else:
-        # Низкая оценка (1-3) — просим комментарий
-        await query.message.reply_text(
-            f"Вы поставили {rating}/5. Что можно улучшить в ответе? "
-            f"Напишите пожалуйста — это поможет сделать бота точнее."
-        )
-        # Переводим пользователя в режим ввода комментария
+        # Частично или Не помогло — просим комментарий
+        if rating == 3:
+            prompt = "Что именно не хватило в ответе? Напишите — постараемся улучшить."
+        else:
+            prompt = "Жаль, что не помогло. Напишите что было не так — это поможет нам стать лучше."
+        await query.message.reply_text(prompt)
         awaiting_correction[query.from_user.id] = msg_id
 
 
