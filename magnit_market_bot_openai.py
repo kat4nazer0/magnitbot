@@ -271,7 +271,45 @@ pending_feedback: dict[int, dict] = {}
 awaiting_correction: dict[int, int] = {}
 
 
-def get_response(user_id: int, user_message: str) -> str:
+def needs_feedback(user_message: str, answer: str) -> bool:
+    """Определяет нужна ли кнопка оценки после этого ответа.
+    Оценка нужна только когда бот отвечает на содержательный вопрос по теме.
+    Не нужна для: приветствий, вопросов о возможностях бота, коротких
+    уточнений, сообщений не по теме, технических ошибок."""
+
+    # Не показываем если это техническая ошибка
+    if "Техническая ошибка" in answer:
+        return False
+
+    # Короткие сообщения пользователя — скорее всего не вопрос по теме
+    if len(user_message.strip()) < 10:
+        return False
+
+    # Служебные паттерны — вопросы о боте, приветствия, благодарности
+    service_patterns = [
+        "что ты умеешь", "что умеешь", "что можешь", "чем можешь помочь",
+        "привет", "здравствуй", "добрый", "как дела", "кто ты", "что ты",
+        "помоги мне", "расскажи о себе", "что такое этот бот",
+        "спасибо", "благодарю", "понял", "окей", "ок", "хорошо",
+        "ясно", "понятно", "отлично", "супер", "класс", "👍", "👌",
+    ]
+    msg_lower = user_message.lower().strip()
+    if any(p in msg_lower for p in service_patterns):
+        return False
+
+    # Если бот ответил что не знает ответа — тоже не просим оценку
+    no_answer_patterns = [
+        "нет точного ответа", "не могу помочь с этим вопросом",
+        "специализируюсь только на вопросах", "не связан с работой"
+    ]
+    if any(p in answer.lower() for p in no_answer_patterns):
+        return False
+
+    return True
+
+
+def get_response(user_id: int, user_message: str) -> tuple[str, bool]:
+    """Возвращает (ответ бота, нужна_ли_оценка)."""
     if user_id not in histories:
         histories[user_id] = []
 
@@ -294,18 +332,17 @@ def get_response(user_id: int, user_message: str) -> str:
         answer = response.choices[0].message.content
 
         # Разворачиваем markdown-ссылки [текст](url) → url
-        # Telegram их не рендерит — показывает сырой текст
         answer = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\2', answer)
-        # Убираем markdown-жирный **текст** и *курсив* — Telegram без parse_mode их не рендерит
+        # Убираем markdown-жирный **текст** и *курсив*
         answer = re.sub(r'\*\*([^*]+)\*\*', r'\1', answer)
         answer = re.sub(r'\*([^*]+)\*', r'\1', answer)
 
         histories[user_id].append({"role": "assistant", "content": answer})
-        return answer
+        return answer, needs_feedback(user_message, answer)
 
     except Exception as e:
         logger.error(f"Ошибка OpenAI для user {user_id}: {e}")
-        return f"Техническая ошибка: {str(e)}\n\nОбратитесь в поддержку: @MagnitMarketBusiness_Bot"
+        return f"Техническая ошибка: {str(e)}\n\nОбратитесь в поддержку: @MagnitMarketBusiness_Bot", False
 
 
 def feedback_keyboard() -> InlineKeyboardMarkup:
@@ -387,19 +424,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         chat_id=update.effective_chat.id, action="typing"
     )
 
-    answer = get_response(user.id, user_message)
-    sent_message = await update.message.reply_text(
-        answer + "\n\nОцените ответ:",
-        reply_markup=feedback_keyboard()
-    )
+    answer, show_feedback = get_response(user.id, user_message)
 
-    pending_feedback[sent_message.message_id] = {
-        "user_id": user.id,
-        "username": user.username or user.first_name,
-        "question": user_message,
-        "answer": answer,
-        "rating": None,
-    }
+    if show_feedback:
+        sent_message = await update.message.reply_text(
+            answer + "\n\nОцените ответ:",
+            reply_markup=feedback_keyboard()
+        )
+        pending_feedback[sent_message.message_id] = {
+            "user_id": user.id,
+            "username": user.username or user.first_name,
+            "question": user_message,
+            "answer": answer,
+            "rating": None,
+        }
+    else:
+        # Служебный ответ (приветствие, не по теме и т.д.) — без кнопок оценки
+        await update.message.reply_text(answer)
 
 
 # ─────────────────────────────────────────────────────────
